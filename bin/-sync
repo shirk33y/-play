@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Manual ~/.-sync examples
+# -----------------------------------------------------------------------------
+# Files are TSV. They are intentionally readable/editable with awk/cut/sort.
+# Paths with tabs/newlines are skipped by -sync to keep this simple.
+#
+# meta columns:
+#   1 id           dev:ino
+#   2 path         absolute path
+#   3 size         bytes
+#   4 mtime_ns     modification time as epoch nanoseconds, derived from stat seconds
+#   5 ctime_ns     ctime as epoch nanoseconds, derived from stat seconds
+#   6 kind         image|video
+#   7 ext          lowercase extension
+#   8 width
+#   9 height
+#  10 duration     seconds
+#  11 bitrate_mbps Mbps
+#  12 mp           megapixels
+#  13 animated     0|1; also means “probe was attempted” when non-empty
+#  14 hash         only filled when -x/--hash is used
+#  15 missing      0|1
+#
+# tag columns:
+#   1 id
+#   2 path
+#   3 tag_name     fav|del|0..9
+#   4 count
+#   5 added_at     epoch seconds
+#   6 updated_at   epoch seconds
+#
+# List active files in meta:
+#   awk -F '\t' 'NR>1 && $15==0 {print $2}' ~/.-sync/meta
+#
+# List missing files remembered by meta:
+#   awk -F '\t' 'NR>1 && $15!=0 {print $2}' ~/.-sync/meta
+#
+# Count images/videos:
+#   awk -F '\t' 'NR>1 && $15==0 {c[$6]++} END{for (k in c) print k, c[k]}' ~/.-sync/meta
+#
+# Largest active files:
+#   awk -F '\t' 'NR>1 && $15==0 {print $3 "\t" $2}' ~/.-sync/meta | sort -nr | head
+#
+# Newest active files:
+#   awk -F '\t' 'NR>1 && $15==0 {print $4 "\t" $2}' ~/.-sync/meta | sort -nr | head
+#
+# Files longer than 10 minutes:
+#   awk -F '\t' 'NR>1 && $15==0 && $10+0 > 600 {print $2}' ~/.-sync/meta
+#
+# Files above 10 Mbps:
+#   awk -F '\t' 'NR>1 && $15==0 && $11+0 > 10 {print $2}' ~/.-sync/meta
+#
+# Images above 12 MP:
+#   awk -F '\t' 'NR>1 && $15==0 && $6=="image" && $12+0 > 12 {print $2}' ~/.-sync/meta
+#
+# Files with hashes:
+#   awk -F '\t' 'NR>1 && $14!="" {print $14 "\t" $2}' ~/.-sync/meta
+#
+# Possible duplicate hashes:
+#   awk -F '\t' 'NR>1 && $14!="" {c[$14]++; p[$14]=p[$14] "\n" $2} END{for (h in c) if (c[h]>1) print h p[h] "\n"}' ~/.-sync/meta
+#
+# List all tags:
+#   awk -F '\t' 'NR>1 {print $3 "\t" $4 "\t" $2}' ~/.-sync/tag
+#
+# List favorite files:
+#   awk -F '\t' 'NR>1 && $3=="fav" {print $2}' ~/.-sync/tag
+#
+# List files marked for deletion review:
+#   awk -F '\t' 'NR>1 && $3=="del" {print $2}' ~/.-sync/tag
+#
+# List files tagged numeric 6:
+#   awk -F '\t' 'NR>1 && $3=="6" {print $2}' ~/.-sync/tag
+#
+# Most frequently tagged favorites:
+#   awk -F '\t' 'NR>1 && $3=="fav" {print $4 "\t" $2}' ~/.-sync/tag | sort -nr | head
+#
+# Join active meta with tags by id:
+#   awk -F '\t' '
+#     FNR==NR { if (NR>1 && $15==0) path[$1]=$2; next }
+#     FNR>1 && ($1 in path) { print $3 "\t" path[$1] }
+#   ' ~/.-sync/meta ~/.-sync/tag
+# -----------------------------------------------------------------------------
+
+SYNC_DIR="${SYNC_DIR:-$HOME/.-sync}"
+META="$SYNC_DIR/meta"
+TAG="$SYNC_DIR/tag"
+INCLUDE="$SYNC_DIR/include"
+EXCLUDE="$SYNC_DIR/exclude"
+BACKUPS="$SYNC_DIR/backups"
+THUMBS="$SYNC_DIR/thumbs"
+WORK="$SYNC_DIR/work"
+PARTIAL="$WORK/partial"
+LOCK="$SYNC_DIR/lock"
+VERSION="0.8.3"
+
+fast=0
+no_probe=0
+do_hash=0
+no_thumbs=0
+jobs=0
+paths=()
+
+log() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<'HELP'
+-sync - resumable atomic metadata indexer for -play
+
+Usage:
+  -sync [OPTIONS] [PATH ...]
+
+Behavior:
+  Without PATH:
+    full sync using ~/.-sync/include
+
+  With PATH:
+    one-shot sync of PATH; does not modify ~/.-sync/include
+
+Options:
+  -f, --fast                  Fast sync: fd + stat + ext/kind only
+                              Disables probe and thumbnails. Hash only if --hash is explicit.
+
+  -P, --no-probe              Disable external metadata probes
+                              No ffprobe, vipsheader, identify, mediainfo, etc.
+
+  -x, --hash                  Compute content hash for new/changed files
+                              Existing valid hashes are reused. Default: off.
+
+  -T, --no-thumbs             Do not create/update thumbnails
+                              Placeholder for future thumbnail support
+
+  -j, --jobs N                Number of GNU parallel jobs
+                              0 = auto
+                              default = max(1, floor(nproc / 2))
+
+  -h, --help                  Show help
+
+Examples:
+  -sync
+  -sync ~/Videos
+  -sync ~/Videos ~/Pictures
+  -sync -f ~/Videos
+  -sync --fast ~/Videos
+  -sync -P -T ~/Videos
+  -sync --hash ~/Videos
+  -sync -f --hash ~/Videos
+  -sync -j 8 ~/Videos
+  -sync -j 0 ~/Videos
+HELP
+}
+
+need_value() { local opt="$1" val="${2-}"; [[ -n "$val" ]] || { log "$opt requires a value"; exit 2; }; printf '%s\n' "$val"; }
+
+if [[ "${1-}" == "__stat" ]]; then
+  path="$2"
+  if [[ "$path" == *$'\t'* || "$path" == *$'\n'* ]]; then log "sync: skip path with tab/newline: $path"; exit 0; fi
+  [[ -f "$path" ]] || exit 0
+  ext="${path##*.}"; ext="${ext,,}"
+  kind=other
+  case " $IMAGE_EXTS " in *" $ext "*) kind=image ;; esac
+  case " $VIDEO_EXTS " in *" $ext "*) kind=video ;; esac
+  [[ "$kind" == other ]] && exit 0
+  st="$(stat -c $'%d:%i\t%s\t%Y\t%Z' -- "$path" 2>/dev/null || true)"
+  [[ -n "$st" ]] || { log "sync: stat failed: $path"; exit 0; }
+  IFS=$'\t' read -r id size mtime_s ctime_s <<< "$st"
+  log "sync: stat $path"
+  printf '%s\t%s\t%s\t%s000000000\t%s000000000\t%s\t%s\n' "$id" "$path" "$size" "$mtime_s" "$ctime_s" "$kind" "$ext"
+  exit 0
+fi
+
+if [[ "${1-}" == "__probe" ]]; then
+  no_probe_worker="$2"; do_hash_worker="$3"; have_probe="$4"
+  id="$5"; path="$6"; size="$7"; mtime_ns="$8"; ctime_ns="$9"; kind="${10}"; ext="${11}"
+  width="${12}"; height="${13}"; duration="${14}"; bitrate_mbps="${15}"; mp="${16}"; animated="${17}"; hash="${18}"
+  missing=0
+
+  is_ambiguous=0
+  case " $AMBIGUOUS_EXTS " in *" $ext "*) is_ambiguous=1 ;; esac
+
+  if [[ "$no_probe_worker" == "0" && "$have_probe" != "1" ]]; then
+    if [[ "$kind" == "video" ]]; then
+      animated=1
+      if command -v ffprobe >/dev/null 2>&1; then
+        log "sync: probe video $path"
+        out="$(timeout 15s ffprobe -v error -select_streams v:0 \
+          -show_entries stream=width,height,duration,bit_rate:format=duration,bit_rate \
+          -of default=nw=1:nk=0 "$path" 2>/dev/null || true)"
+        while IFS='=' read -r key val; do
+          [[ -z "${key:-}" || "${val:-}" == "N/A" ]] && continue
+          case "$key" in
+            width) [[ -z "$width" ]] && width="$val" ;;
+            height) [[ -z "$height" ]] && height="$val" ;;
+            duration|format.duration) [[ -z "$duration" ]] && duration="$val" ;;
+            bit_rate|format.bit_rate) [[ -z "$bitrate_mbps" && "$val" =~ ^[0-9]+([.][0-9]+)?$ ]] && bitrate_mbps="$(gawk -v b="$val" 'BEGIN{printf "%.6f", b/1000000}')" ;;
+          esac
+        done <<< "$out"
+      else
+        log "sync: ffprobe missing, no video probe: $path"
+      fi
+    elif [[ "$kind" == "image" ]]; then
+      log "sync: probe image $path"
+      animated=0
+      if command -v vipsheader >/dev/null 2>&1; then
+        width="$(timeout 5s vipsheader -f width "$path" 2>/dev/null || true)"
+        height="$(timeout 5s vipsheader -f height "$path" 2>/dev/null || true)"
+      elif command -v identify >/dev/null 2>&1; then
+        dim="$(timeout 10s identify -ping -format '%w\t%h' "$path" 2>/dev/null || true)"
+        IFS=$'\t' read -r width height <<< "$dim"
+      else
+        log "sync: no image probe tool: $path"
+      fi
+      if [[ "$is_ambiguous" == "1" && -n "$width" ]]; then
+        if command -v identify >/dev/null 2>&1; then
+          frames="$(timeout 10s identify -ping -format '%n' "$path" 2>/dev/null | head -c 16 || true)"
+          if [[ "$frames" =~ ^[0-9]+$ && "$frames" -gt 1 ]]; then animated=1; kind=video; fi
+        fi
+      fi
+    fi
+  else
+    if [[ "$no_probe_worker" == "1" ]]; then log "sync: no-probe $path"; else log "sync: cache probe $path"; fi
+  fi
+
+  if [[ "$width" =~ ^[0-9]+$ && "$height" =~ ^[0-9]+$ ]]; then
+    mp="$(gawk -v w="$width" -v h="$height" 'BEGIN{printf "%.6f", (w*h)/1000000}')"
+  fi
+
+  if [[ "$do_hash_worker" == "1" && -z "$hash" ]]; then
+    if command -v b3sum >/dev/null 2>&1; then
+      log "sync: hash b3sum $path"
+      hash="$(b3sum -- "$path" 2>/dev/null | gawk '{print $1}' || true)"
+    elif command -v sha256sum >/dev/null 2>&1; then
+      log "sync: hash sha256sum $path"
+      hash="$(sha256sum -- "$path" 2>/dev/null | gawk '{print $1}' || true)"
+    elif command -v sha1sum >/dev/null 2>&1; then
+      log "sync: hash sha1sum $path"
+      hash="$(sha1sum -- "$path" 2>/dev/null | gawk '{print $1}' || true)"
+    else
+      log "sync: no hash tool: $path"
+    fi
+  elif [[ "$do_hash_worker" == "1" ]]; then
+    log "sync: cache hash $path"
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\n' \
+    "$id" "$path" "$size" "$mtime_ns" "$ctime_ns" "$kind" "$ext" "$width" "$height" "$duration" "$bitrate_mbps" "$mp" "$animated" "$hash"
+  exit 0
+fi
+
+while (($#)); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --version) echo "-sync $VERSION"; exit 0 ;;
+    -f|--fast) fast=1; no_probe=1; no_thumbs=1; shift ;;
+    -P|--no-probe) no_probe=1; shift ;;
+    -x|--hash) do_hash=1; shift ;;
+    -H|--no-hash) do_hash=0; shift ;; # compatibility no-op: hash is opt-in
+    -T|--no-thumbs) no_thumbs=1; shift ;;
+    -j|--jobs) jobs="$(need_value "$1" "${2-}")"; [[ "$jobs" =~ ^[0-9]+$ ]] || { log "bad jobs: $jobs"; exit 2; }; shift 2 ;;
+    --jobs=*) jobs="${1#--jobs=}"; [[ "$jobs" =~ ^[0-9]+$ ]] || { log "bad jobs: $jobs"; exit 2; }; shift ;;
+    --) shift; while (($#)); do paths+=("$1"); shift; done ;;
+    *) paths+=("$1"); shift ;;
+  esac
+done
+
+for cmd in fd gawk stat realpath parallel; do
+  command -v "$cmd" >/dev/null || { log "missing dependency: $cmd"; exit 127; }
+done
+
+cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+if [[ "$jobs" == "0" ]]; then
+  jobs=$(( cores / 2 ))
+  (( jobs < 1 )) && jobs=1
+fi
+
+mkdir -p "$SYNC_DIR" "$BACKUPS" "$THUMBS" "$WORK"
+[[ -e "$INCLUDE" ]] || : > "$INCLUDE"
+[[ -e "$EXCLUDE" ]] || : > "$EXCLUDE"
+[[ -e "$META" ]] || printf 'id\tpath\tsize\tmtime_ns\tctime_ns\tkind\text\twidth\theight\tduration\tbitrate_mbps\tmp\tanimated\thash\tmissing\n' > "$META"
+[[ -e "$TAG" ]] || printf 'id\tpath\ttag_name\tcount\tadded_at\tupdated_at\n' > "$TAG"
+[[ -e "$PARTIAL" ]] || printf 'id\tpath\tsize\tmtime_ns\tctime_ns\tkind\text\twidth\theight\tduration\tbitrate_mbps\tmp\tanimated\thash\tmissing\n' > "$PARTIAL"
+
+if ! mkdir "$LOCK" 2>/dev/null; then
+  log "sync already running: $LOCK"
+  exit 1
+fi
+
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/-sync.XXXXXX")"
+cleanup() { rm -rf -- "$tmpdir"; rmdir "$LOCK" 2>/dev/null || true; }
+on_abort() { log "sync: aborted; old meta/tag kept; resume checkpoint kept at $PARTIAL"; cleanup; exit 130; }
+trap cleanup EXIT
+trap on_abort INT TERM
+
+backup_rotate_if_changed() {
+  local name="$1" file="$2" dst
+  [[ -e "$file" ]] || return 0
+  dst="$BACKUPS/$name.1"
+  if [[ -e "$dst" ]] && cmp -s -- "$file" "$dst"; then return 0; fi
+  rm -f -- "$BACKUPS/$name.5"
+  for i in 4 3 2 1; do [[ -e "$BACKUPS/$name.$i" ]] && mv -f -- "$BACKUPS/$name.$i" "$BACKUPS/$name.$((i+1))"; done
+  cp -a -- "$file" "$dst"
+}
+
+install_atomic() {
+  local tmp="$1" dest="$2" name="$3"
+  if [[ -e "$dest" ]] && cmp -s -- "$tmp" "$dest"; then rm -f -- "$tmp"; return 0; fi
+  backup_rotate_if_changed "$name" "$dest"
+  mv -f -- "$tmp" "$dest"
+}
+
+expand_path() { local p="$1"; [[ "$p" == "~/"* ]] && p="$HOME/${p#~/}"; realpath -m -- "$p"; }
+
+roots=()
+if ((${#paths[@]})); then
+  for p in "${paths[@]}"; do roots+=("$(expand_path "$p")"); done
+else
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    roots+=("$(expand_path "$line")")
+  done < "$INCLUDE"
+fi
+
+if ((${#roots[@]} == 0)); then
+  log "sync: no paths. Pass PATH or add roots to $INCLUDE"
+  exit 2
+fi
+
+video_ext=(
+  3g2 3gp 3gp2 3gpp amv asf avi av1 bik dav divx drc dv dvr-ms evo
+  f4v flv h264 h265 hevc ivf m1v m2p m2t m2ts m2v m4v mj2 mjpeg mk3d
+  mkv mod mov mp4 mp4v mpe mpeg mpg mpg2 mts mxf nsv nut ogm ogv qt
+  rm rmvb roq smk swf tod trp ts vob webm wm wmv wtv y4m yuv
+)
+image_ext=(
+  apng avif bmp cur dds dib dpx exr farbfeld ff fits gif hdr heic heif ico
+  j2c j2k jfif jp2 jpc jpe jpeg jpg jxl pam pbm pcx pfm pgm phm pict pix
+  png pnm ppm psd qoi ras sgi svg tga tif tiff txd webp xbm xpm xwd
+)
+ambiguous_ext=(gif webp apng avif)
+
+export VIDEO_EXTS="${video_ext[*]}"
+export IMAGE_EXTS="${image_ext[*]}"
+export AMBIGUOUS_EXTS="${ambiguous_ext[*]}"
+
+ext_args=()
+seen_ext=" "
+for e in "${video_ext[@]}" "${image_ext[@]}" "${ambiguous_ext[@]}"; do
+  [[ "$seen_ext" == *" $e "* ]] && continue
+  seen_ext+="$e "
+  ext_args+=(-e "$e")
+done
+
+file_list="$tmpdir/files0"
+stat_rows="$tmpdir/stat.tsv"
+cache_rows="$tmpdir/cache.tsv"
+reused_rows="$tmpdir/reused.tsv"
+probe_input="$tmpdir/probe-input.tsv"
+probed_rows="$tmpdir/probed.tsv"
+new_rows="$tmpdir/new.tsv"
+meta_tmp="$tmpdir/meta.tmp"
+tag_tmp="$tmpdir/tag.tmp"
+: > "$file_list"
+: > "$stat_rows"
+: > "$reused_rows"
+: > "$probe_input"
+: > "$probed_rows"
+
+log "sync: mode $([[ $fast == 1 ]] && echo fast || echo full), jobs=$jobs, no_probe=$no_probe, hash=$do_hash, no_thumbs=$no_thumbs"
+
+for root in "${roots[@]}"; do
+  if [[ -f "$root" ]]; then
+    printf '%s\0' "$root" >> "$file_list"
+  elif [[ -d "$root" ]]; then
+    log "sync: scan $root"
+    if [[ -s "$EXCLUDE" ]]; then
+      fd -a -t f -0 "${ext_args[@]}" --ignore-file "$EXCLUDE" . "$root" >> "$file_list"
+    else
+      fd -a -t f -0 "${ext_args[@]}" . "$root" >> "$file_list"
+    fi
+  else
+    log "sync: skip missing root: $root"
+  fi
+done
+
+log "sync: stat files"
+parallel --will-cite -0 -j "$jobs" -- "$0" __stat {} < "$file_list" > "$stat_rows"
+
+# Newer rows in work/partial override old meta for resume/cache. Final meta is still atomic.
+cat "$META" "$PARTIAL" > "$cache_rows"
+
+log "sync: split cached/changed"
+gawk -F '\t' -v OFS='\t' -v cache="$cache_rows" -v probe_input="$probe_input" -v need_probe="$((1-no_probe))" -v do_hash="$do_hash" '
+  BEGIN {
+    while ((getline line < cache) > 0) {
+      split(line, m, FS); if (m[1] == "id" || m[1] == "") continue;
+      old[m[1]]=line;
+    }
+  }
+  function emit_probe(have_probe, id,path,size,mtime,ctime,kind,ext,width,height,duration,bitrate,mp,animated,hash) {
+    print have_probe,id,path,size,mtime,ctime,kind,ext,width,height,duration,bitrate,mp,animated,hash > probe_input;
+  }
+  {
+    id=$1; path=$2; size=$3; mtime=$4; ctime=$5; kind=$6; ext=$7;
+    if (id in old) {
+      split(old[id], m, FS);
+      same=(m[3]==size && m[4]==mtime && m[5]==ctime);
+      if (same) {
+        probe_ok=(!need_probe || m[13] != "");
+        hash_ok=(!do_hash || m[14] != "");
+        if (probe_ok && hash_ok) {
+          m[2]=path; m[15]=0;
+          print m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14],m[15];
+        } else {
+          have_probe=(m[13] != "") ? 1 : 0;
+          emit_probe(have_probe,id,path,size,mtime,ctime,m[6],m[7],m[8],m[9],m[10],m[11],m[12],m[13],m[14]);
+        }
+      } else {
+        emit_probe(0,id,path,size,mtime,ctime,kind,ext,"","","","","","","");
+      }
+    } else {
+      emit_probe(0,id,path,size,mtime,ctime,kind,ext,"","","","","","","");
+    }
+  }
+' "$stat_rows" > "$reused_rows"
+
+if [[ -s "$probe_input" ]]; then
+  changed_count="$(wc -l < "$probe_input" | tr -d ' ')"
+  log "sync: process $changed_count changed/missing-cache files"
+  if [[ "$no_probe" == "1" && "$do_hash" == "0" ]]; then
+    # Pure fast/no-probe path: no worker needed. Keep this extremely cheap.
+    gawk -F '\t' -v OFS='\t' '{
+      # input: have_probe,id,path,size,mtime,ctime,kind,ext,width,height,duration,bitrate,mp,animated,hash
+      print $2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0
+      print "sync: no-probe " $3 > "/dev/stderr"
+    }' "$probe_input" | tee -a "$PARTIAL" > "$probed_rows"
+  else
+    parallel --will-cite -j "$jobs" --colsep '\t' -- "$0" __probe "$no_probe" "$do_hash" {1} {2} {3} {4} {5} {6} {7} {8} {9} {10} {11} {12} {13} {14} {15} :::: "$probe_input" \
+      | tee -a "$PARTIAL" > "$probed_rows"
+  fi
+else
+  log "sync: all files satisfied by cache"
+fi
+
+cat "$reused_rows" "$probed_rows" > "$new_rows"
+
+log "sync: merge missing old records"
+printf 'id\tpath\tsize\tmtime_ns\tctime_ns\tkind\text\twidth\theight\tduration\tbitrate_mbps\tmp\tanimated\thash\tmissing\n' > "$meta_tmp"
+gawk -F '\t' -v OFS='\t' '
+  NR==FNR { if ($1 != "" && $1 != "id") { seen[$1]=1; print } next }
+  FNR==1 && $1=="id" { next }
+  $1 != "" && !($1 in seen) { $15=1; print }
+' "$new_rows" "$META" >> "$meta_tmp"
+
+log "sync: rebuild tag paths"
+printf 'id\tpath\ttag_name\tcount\tadded_at\tupdated_at\n' > "$tag_tmp"
+gawk -F '\t' -v OFS='\t' '
+  NR==FNR { if (FNR>1 && $15==0) path[$1]=$2; next }
+  FNR==1 && $1=="id" { next }
+  $1 == "" { next }
+  {
+    id=$1; p=$2; tag=$3; count=$4; added=$5; updated=$6;
+    if (id in path) p=path[id];
+    key=id SUBSEP tag;
+    if (!(key in seen)) { seen[key]=1; print id,p,tag,count,added,updated }
+  }
+' "$meta_tmp" "$TAG" >> "$tag_tmp"
+
+backup_rotate_if_changed include "$INCLUDE"
+backup_rotate_if_changed exclude "$EXCLUDE"
+install_atomic "$meta_tmp" "$META" meta
+install_atomic "$tag_tmp" "$TAG" tag
+printf 'id\tpath\tsize\tmtime_ns\tctime_ns\tkind\text\twidth\theight\tduration\tbitrate_mbps\tmp\tanimated\thash\tmissing\n' > "$PARTIAL"
+
+active="$(gawk -F '\t' 'NR>1 && $15==0 {c++} END{print c+0}' "$META")"
+missing="$(gawk -F '\t' 'NR>1 && $15!=0 {c++} END{print c+0}' "$META")"
+tag_count="$(gawk -F '\t' 'NR>1 {c++} END{print c+0}' "$TAG")"
+log "sync: synced $active active, $missing missing, $tag_count tags"
+printf 'synced: %s active, %s missing, %s tags\n' "$active" "$missing" "$tag_count"

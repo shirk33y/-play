@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 fd-find gawk parallel ffmpeg libvips-tools imagemagick coreutils zip unzip
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+      - name: CLI tests
+        run: tests/run-cli-tests.sh
+      - name: Lua tests
+        run: tests/run-lua-tests.sh
+      - name: Behavior regression tests
+        run: tests/run-behavior-tests.py

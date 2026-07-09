@@ -1,2 +1,413 @@
 #!/usr/bin/env bash
-echo placeholder
+set -euo pipefail
+
+SYNC_DIR="${SYNC_DIR:-$HOME/.-sync}"
+META="$SYNC_DIR/meta"
+TAG="$SYNC_DIR/tag"
+EXCLUDE="$SYNC_DIR/exclude"
+VERSION="0.8.3"
+
+want_image=0
+want_video=0
+only_meta=0
+list_only=0
+tag_filter=""
+size_filter=""
+age_filter=""
+duration_filter=""
+resolution_filter=""
+bitrate_filter=""
+main_args=()
+fd_args=()
+mpv_args=()
+section=main
+
+log() { printf '%s\n' "$*" >&2; }
+
+usage() {
+  cat <<'HELP'
+-play - fast live/indexed media playlist for mpv
+
+Usage:
+  -play [OPTIONS] [QUERY_OR_PATH ...] [-F|--fd-args FD_ARGS ...] [-M|--mpv-args MPV_ARGS ...]
+
+Modes:
+  -i, --image                 Play/list images only
+  -v, --video                 Play/list videos only
+  -f, --fav                   Alias for --tag fav
+  -g, --tag TAG               Filter by tag: fav, del, 0..9
+  -m, --meta                  Use ~/.-sync/meta only; do not scan filesystem
+  -l, --list                  Print selected files; do not start mpv
+
+Filters:
+  -s, --size [+|-]SIZE        Filter by file size. Bare value means +VALUE.
+                              Examples: -s +20M, -s -500K, -s 2G
+
+  -a, --age [+|-]AGE          Filter by modification age.
+                              5d / -5d = changed within 5 days; +5d = older than 5 days.
+                              Examples: -a 5d, -a -5d, -a +30d
+
+  -d, --duration [+|-]DUR     Filter by duration from existing meta only.
+                              Examples: -d +10m, -d -30s, -d 1h
+
+  -r, --resolution [+|-]MP    Filter by megapixels from existing meta only.
+      --resolution PRESET     Presets: xs, s, m, l, xl. Bare numeric means +VALUE.
+                              Examples: -r +2.1, -r -8.5, -r l
+
+  -b, --bitrate [+|-]MBPS     Filter by bitrate from existing meta only. Bare value means +VALUE.
+                              Examples: -b +10.5, -b -4, -b 20
+
+Pass-through sections:
+  -F, --fd-args ...           Everything after this goes to fd until -M/--mpv-args or end
+  -M, --mpv-args ...          Everything after this goes to mpv until -F/--fd-args or end
+
+Other:
+  -h, --help                  Show help
+
+Examples:
+  -play ~/Videos
+  -play -v ~/Videos
+  -play -i ~/Pictures
+  -play -v -a 5d -s +20M ~/Videos
+  -play -v -d +10m ~/Videos
+  -play -i -r +12.5 ~/Pictures
+  -play -v -b +10.5 ~/Videos
+  -play -g del
+  -play -f -v
+  -play -m -v ~/NAS
+  -play -l -v ~/Videos
+  -play -v ~/Videos -F -H -d 2 -M --shuffle --fs
+HELP
+}
+
+need_value() {
+  local opt="$1" val="${2-}"
+  [[ -n "$val" ]] || { log "$opt requires a value"; exit 2; }
+  printf '%s\n' "$val"
+}
+
+valid_tag() {
+  case "$1" in fav|del|[0-9]) return 0 ;; *) return 1 ;; esac
+}
+
+while (($#)); do
+  case "$1" in
+    -F|--fd-args) section=fd; shift; continue ;;
+    -M|--mpv-args) section=mpv; shift; continue ;;
+  esac
+  case "$section" in
+    fd)
+      case "$1" in -M|--mpv-args) section=mpv; shift ;; *) fd_args+=("$1"); shift ;; esac
+      ;;
+    mpv)
+      case "$1" in -F|--fd-args) section=fd; shift ;; *) mpv_args+=("$1"); shift ;; esac
+      ;;
+    main)
+      case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --version) echo "-play $VERSION"; exit 0 ;;
+        -i|--image) want_image=1; shift ;;
+        -v|--video) want_video=1; shift ;;
+        -m|--meta) only_meta=1; shift ;;
+        -l|--list) list_only=1; shift ;;
+        -f|--fav) tag_filter=fav; shift ;;
+        -g|--tag) tag_filter="$(need_value "$1" "${2-}")"; valid_tag "$tag_filter" || { log "bad tag: $tag_filter"; exit 2; }; shift 2 ;;
+        --tag=*) tag_filter="${1#--tag=}"; valid_tag "$tag_filter" || { log "bad tag: $tag_filter"; exit 2; }; shift ;;
+        -s|--size) size_filter="$(need_value "$1" "${2-}")"; shift 2 ;;
+        --size=*) size_filter="${1#--size=}"; shift ;;
+        -a|--age) age_filter="$(need_value "$1" "${2-}")"; shift 2 ;;
+        --age=*) age_filter="${1#--age=}"; shift ;;
+        -d|--duration) duration_filter="$(need_value "$1" "${2-}")"; shift 2 ;;
+        --duration=*) duration_filter="${1#--duration=}"; shift ;;
+        -r|--resolution) resolution_filter="$(need_value "$1" "${2-}")"; shift 2 ;;
+        --resolution=*) resolution_filter="${1#--resolution=}"; shift ;;
+        -b|--bitrate) bitrate_filter="$(need_value "$1" "${2-}")"; shift 2 ;;
+        --bitrate=*) bitrate_filter="${1#--bitrate=}"; shift ;;
+        --) shift; while (($#)); do main_args+=("$1"); shift; done ;;
+        *) main_args+=("$1"); shift ;;
+      esac
+      ;;
+  esac
+done
+
+if (( want_image == 0 && want_video == 0 )); then
+  want_image=1
+  want_video=1
+fi
+
+if (( only_meta )) && ((${#fd_args[@]})); then
+  log "--fd-args cannot be used with --meta"
+  exit 2
+fi
+
+for cmd in fd gawk realpath; do
+  command -v "$cmd" >/dev/null || { log "missing dependency: $cmd"; exit 127; }
+done
+if (( ! list_only )); then
+  command -v mpv >/dev/null || { log "missing dependency: mpv"; exit 127; }
+fi
+if [[ -n "$size_filter$age_filter$duration_filter$resolution_filter$bitrate_filter$tag_filter" ]] && (( ! only_meta )); then
+  command -v stat >/dev/null || { log "missing dependency: stat"; exit 127; }
+fi
+
+video_ext=(
+  3g2 3gp 3gp2 3gpp amv asf avi av1 bik dav divx drc dv dvr-ms evo
+  f4v flv h264 h265 hevc ivf m1v m2p m2t m2ts m2v m4v mj2 mjpeg mk3d
+  mkv mod mov mp4 mp4v mpe mpeg mpg mpg2 mts mxf nsv nut ogm ogv qt
+  rm rmvb roq smk swf tod trp ts vob webm wm wmv wtv y4m yuv
+)
+image_ext=(
+  apng avif bmp cur dds dib dpx exr farbfeld ff fits gif hdr heic heif ico
+  j2c j2k jfif jp2 jpc jpe jpeg jpg jxl pam pbm pcx pfm pgm phm pict pix
+  png pnm ppm psd qoi ras sgi svg tga tif tiff txd webp xbm xpm xwd
+)
+ambiguous_ext=(gif webp apng avif)
+
+has_ext() { local x="$1" e; shift; for e in "$@"; do [[ "$x" == "$e" ]] && return 0; done; return 1; }
+fallback_kind() {
+  local ext="$1"
+  if has_ext "$ext" "${image_ext[@]}"; then echo image
+  elif has_ext "$ext" "${video_ext[@]}"; then echo video
+  else echo other
+  fi
+}
+
+ext_args=()
+add_exts() {
+  local seen=" " e
+  for e in "$@"; do
+    [[ "$seen" == *" $e "* ]] && continue
+    seen+="$e "
+    ext_args+=(-e "$e")
+  done
+}
+(( want_video )) && add_exts "${video_ext[@]}" "${ambiguous_ext[@]}"
+(( want_image )) && add_exts "${image_ext[@]}"
+
+parse_bytes() {
+  local raw="$1"
+  gawk -v raw="$raw" 'BEGIN {
+    v=raw; sub(/^[+-]/,"",v);
+    if (v !~ /^[0-9]+([.][0-9]+)?([KkMmGgTt][Bb]?|[Bb])?$/) exit 2;
+    unit=toupper(v); sub(/^[0-9]+([.][0-9]+)?/,"",unit); sub(/B$/,"",unit);
+    num=v; sub(/[KkMmGgTt][Bb]?|[Bb]$/,"",num);
+    mult=1;
+    if (unit=="K") mult=1024;
+    else if (unit=="M") mult=1024*1024;
+    else if (unit=="G") mult=1024*1024*1024;
+    else if (unit=="T") mult=1024*1024*1024*1024;
+    printf "%.0f", num*mult;
+  }' || { log "bad size: $raw"; exit 2; }
+}
+
+parse_seconds() {
+  local raw="$1" label="$2"
+  gawk -v raw="$raw" -v label="$label" 'BEGIN {
+    v=raw; sub(/^[+-]/,"",v);
+    if (v !~ /^[0-9]+([.][0-9]+)?([smhdSMHD])?$/) exit 2;
+    unit=tolower(v); sub(/^[0-9]+([.][0-9]+)?/,"",unit);
+    num=v; sub(/[smhdSMHD]$/,"",num);
+    mult=1;
+    if (unit=="m") mult=60;
+    else if (unit=="h") mult=3600;
+    else if (unit=="d") mult=86400;
+    printf "%.6f", num*mult;
+  }' || { log "bad $label: $raw"; exit 2; }
+}
+
+sign_of() { case "$1" in +*) echo gt ;; -*) echo lt ;; *) echo gt ;; esac; }
+
+size_op=""; size_bytes=""
+if [[ -n "$size_filter" ]]; then size_op="$(sign_of "$size_filter")"; size_bytes="$(parse_bytes "$size_filter")"; fi
+
+age_mode=""; age_seconds=""
+if [[ -n "$age_filter" ]]; then
+  case "$age_filter" in +*) age_mode=older ;; *) age_mode=recent ;; esac
+  age_seconds="$(parse_seconds "$age_filter" age)"
+fi
+
+duration_op=""; duration_seconds=""
+if [[ -n "$duration_filter" ]]; then duration_op="$(sign_of "$duration_filter")"; duration_seconds="$(parse_seconds "$duration_filter" duration)"; fi
+
+res_mode=""; res_op=""; res_value=""; res_min=""; res_max=""
+if [[ -n "$resolution_filter" ]]; then
+  case "$resolution_filter" in
+    xs) res_mode=bucket; res_min=""; res_max=0.5 ;;
+    s)  res_mode=bucket; res_min=0.5; res_max=2 ;;
+    m)  res_mode=bucket; res_min=2; res_max=8.5 ;;
+    l)  res_mode=bucket; res_min=8.5; res_max=20 ;;
+    xl) res_mode=bucket; res_min=20; res_max="" ;;
+    *)  res_mode=cmp; res_op="$(sign_of "$resolution_filter")"; res_value="${resolution_filter#[+-]}"; [[ "$res_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log "bad resolution: $resolution_filter"; exit 2; } ;;
+  esac
+fi
+
+bitrate_op=""; bitrate_value=""
+if [[ -n "$bitrate_filter" ]]; then
+  bitrate_op="$(sign_of "$bitrate_filter")"
+  bitrate_value="${bitrate_filter#[+-]}"
+  [[ "$bitrate_value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { log "bad bitrate: $bitrate_filter"; exit 2; }
+fi
+
+path_like() { local x="$1"; [[ -e "$x" || "$x" == /* || "$x" == "~/"* || "$x" == ./* || "$x" == ../* || "$x" == */* ]]; }
+normalize_path() { local p="$1"; [[ "$p" == "~/"* ]] && p="$HOME/${p#~/}"; realpath -m -- "$p"; }
+join_us() { local IFS=$'\034'; echo "$*"; }
+sort_playlist() { LC_ALL=C sort -V; }
+
+roots=()
+query_parts=()
+for arg in "${main_args[@]}"; do
+  if path_like "$arg"; then roots+=("$(normalize_path "$arg")"); else query_parts+=("$arg"); fi
+done
+((${#roots[@]})) || roots=(".")
+pattern="."
+if ((${#query_parts[@]})); then pattern="${query_parts[*]}"; fi
+
+playlist="$(mktemp "${TMPDIR:-/tmp}/-play.playlist.XXXXXX")"
+stat_rows="$(mktemp "${TMPDIR:-/tmp}/-play.stat.XXXXXX")"
+empty_file="$(mktemp "${TMPDIR:-/tmp}/-play.empty.XXXXXX")"
+cleanup() { rm -f -- "$playlist" "$stat_rows" "$empty_file"; }
+trap cleanup EXIT
+META_READ="$META"; [[ -s "$META_READ" ]] || META_READ="$empty_file"
+TAG_READ="$TAG"; [[ -s "$TAG_READ" ]] || TAG_READ="$empty_file"
+
+fd_base=(fd -a -t f "${ext_args[@]}")
+[[ -s "$EXCLUDE" ]] && fd_base+=(--ignore-file "$EXCLUDE")
+fd_base+=("${fd_args[@]}")
+
+needs_stat=0
+needs_meta=0
+[[ -n "$size_filter$age_filter" ]] && needs_stat=1
+[[ -n "$duration_filter$resolution_filter$bitrate_filter$tag_filter" ]] && needs_meta=1
+(( only_meta )) && needs_meta=1
+
+if (( only_meta )); then
+  [[ -s "$META" ]] || { log "play: no meta: $META"; : > "$playlist"; }
+  log "play: meta mode"
+  gawk -F '\t' \
+    -v want_image="$want_image" -v want_video="$want_video" \
+    -v roots="$(join_us "${roots[@]}")" -v query="$pattern" \
+    -v tag_filter="$tag_filter" -v tag_file="$TAG_READ" \
+    -v size_op="$size_op" -v size_bytes="$size_bytes" \
+    -v age_mode="$age_mode" -v age_seconds="$age_seconds" -v now="$(date +%s)" \
+    -v duration_op="$duration_op" -v duration_seconds="$duration_seconds" \
+    -v res_mode="$res_mode" -v res_op="$res_op" -v res_value="$res_value" -v res_min="$res_min" -v res_max="$res_max" \
+    -v bitrate_op="$bitrate_op" -v bitrate_value="$bitrate_value" '
+      BEGIN {
+        nroots=split(roots, r, sprintf("%c", 28));
+        if (tag_file != "") while ((getline line < tag_file) > 0) {
+          split(line, t, FS); if (t[1] == "id" || t[1] == "" || t[3] == "") continue;
+          tags[t[1],t[3]]=1;
+        }
+      }
+      function in_roots(path, i) { for (i=1;i<=nroots;i++) if (r[i] == "." || path == r[i] || index(path, r[i] "/") == 1) return 1; return 0; }
+      function cmp(val, op, target) { if (target == "") return 1; if (val == "") return 0; return op=="lt" ? (val+0 < target+0) : (val+0 > target+0); }
+      function pass_kind(kind) { return (want_image && kind=="image") || (want_video && kind=="video"); }
+      function pass_age(mtime_ns, age) { if (age_seconds == "") return 1; age=(now-(mtime_ns/1000000000)); return age_mode=="older" ? (age > age_seconds) : (age <= age_seconds); }
+      function pass_res(mp) {
+        if (res_mode == "") return 1; if (mp == "") return 0;
+        if (res_mode == "cmp") return cmp(mp, res_op, res_value);
+        if (res_min != "" && mp+0 < res_min+0) return 0;
+        if (res_max != "" && mp+0 >= res_max+0) return 0;
+        return 1;
+      }
+      NR==1 && $1=="id" { next }
+      {
+        id=$1; path=$2; size=$3; mtime_ns=$4; kind=$6; duration=$10; bitrate=$11; mp=$12; missing=$15;
+        if (missing != "0") next;
+        if (!in_roots(path)) next;
+        if (query != "." && path !~ query) next;
+        if (!pass_kind(kind)) next;
+        if (tag_filter != "" && !((id,tag_filter) in tags)) next;
+        if (!cmp(size, size_op, size_bytes)) next;
+        if (!pass_age(mtime_ns)) next;
+        if (!cmp(duration, duration_op, duration_seconds)) next;
+        if (!pass_res(mp)) next;
+        if (!cmp(bitrate, bitrate_op, bitrate_value)) next;
+        print path;
+      }
+    ' "$META_READ" | sort_playlist > "$playlist"
+elif (( ! needs_stat && ! needs_meta )); then
+  log "play: fast path: fd -> playlist"
+  "${fd_base[@]}" "$pattern" "${roots[@]}" | sort_playlist > "$playlist"
+else
+  log "play: rich path: fd/stat + meta/tag filters"
+  : > "$stat_rows"
+  while IFS= read -r -d '' path; do
+    if [[ "$path" == *$'\t'* || "$path" == *$'\n'* ]]; then log "play: skip path with tab/newline: $path"; continue; fi
+    st="$(stat -c $'%d:%i\t%s\t%Y\t%Z' -- "$path" 2>/dev/null || true)"
+    [[ -n "$st" ]] || { log "play: stat failed: $path"; continue; }
+    IFS=$'\t' read -r id size mtime_s ctime_s <<< "$st"
+    mtime_ns="${mtime_s}000000000"; ctime_ns="${ctime_s}000000000"
+    ext="${path##*.}"; ext="${ext,,}"
+    kind="$(fallback_kind "$ext")"
+    [[ "$kind" == other ]] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$path" "$size" "$mtime_ns" "$ctime_ns" "$kind" "$ext" >> "$stat_rows"
+  done < <("${fd_base[@]}" -0 "$pattern" "${roots[@]}")
+
+  gawk -F '\t' \
+    -v want_image="$want_image" -v want_video="$want_video" \
+    -v meta_file="$META_READ" -v tag_file="$TAG_READ" -v tag_filter="$tag_filter" \
+    -v size_op="$size_op" -v size_bytes="$size_bytes" \
+    -v age_mode="$age_mode" -v age_seconds="$age_seconds" -v now="$(date +%s)" \
+    -v duration_op="$duration_op" -v duration_seconds="$duration_seconds" \
+    -v res_mode="$res_mode" -v res_op="$res_op" -v res_value="$res_value" -v res_min="$res_min" -v res_max="$res_max" \
+    -v bitrate_op="$bitrate_op" -v bitrate_value="$bitrate_value" '
+      BEGIN {
+        if (meta_file != "") while ((getline line < meta_file) > 0) {
+          split(line, m, FS); if (m[1] == "id" || m[1] == "") continue;
+          meta[m[1]]=line; msize[m[1]]=m[3]; mmtime[m[1]]=m[4]; mctime[m[1]]=m[5];
+        }
+        if (tag_file != "") while ((getline line < tag_file) > 0) {
+          split(line, t, FS); if (t[1] == "id" || t[1] == "" || t[3] == "") continue;
+          tags[t[1],t[3]]=1;
+        }
+      }
+      function cmp(val, op, target) { if (target == "") return 1; if (val == "") { skipped_missing++; return 0 } return op=="lt" ? (val+0 < target+0) : (val+0 > target+0); }
+      function pass_kind(kind) { return (want_image && kind=="image") || (want_video && kind=="video"); }
+      function pass_age(mtime_ns, age) { if (age_seconds == "") return 1; age=(now-(mtime_ns/1000000000)); return age_mode=="older" ? (age > age_seconds) : (age <= age_seconds); }
+      function pass_res(mp) {
+        if (res_mode == "") return 1; if (mp == "") { skipped_missing++; return 0 }
+        if (res_mode == "cmp") return cmp(mp, res_op, res_value);
+        if (res_min != "" && mp+0 < res_min+0) return 0;
+        if (res_max != "" && mp+0 >= res_max+0) return 0;
+        return 1;
+      }
+      {
+        id=$1; path=$2; size=$3; mtime_ns=$4; ctime_ns=$5; kind=$6; ext=$7;
+        width=height=duration=bitrate=mp=animated=hash=""; missing="0";
+        if (id in meta) {
+          split(meta[id], m, FS);
+          # Reuse rich metadata only when stat identity still matches.
+          if (m[3] == size && m[4] == mtime_ns && m[5] == ctime_ns) {
+            kind=m[6]; width=m[8]; height=m[9]; duration=m[10]; bitrate=m[11]; mp=m[12]; animated=m[13]; hash=m[14]; missing=m[15];
+          }
+        }
+        if (missing != "0") next;
+        if (!pass_kind(kind)) next;
+        if (tag_filter != "" && !((id,tag_filter) in tags)) next;
+        if (!cmp(size, size_op, size_bytes)) next;
+        if (!pass_age(mtime_ns)) next;
+        if (!cmp(duration, duration_op, duration_seconds)) next;
+        if (!pass_res(mp)) next;
+        if (!cmp(bitrate, bitrate_op, bitrate_value)) next;
+        print path;
+      }
+      END { if (skipped_missing > 0) print "play: skipped " skipped_missing " files with missing metadata" > "/dev/stderr" }
+    ' "$stat_rows" | sort_playlist > "$playlist"
+fi
+
+count="$(wc -l < "$playlist" | tr -d ' ')"
+log "play: selected $count files"
+if [[ "$count" == "0" ]]; then
+  log "play: nothing to play"
+  exit 1
+fi
+
+if (( list_only )); then
+  log "play: list mode"
+  cat -- "$playlist"
+  exit 0
+fi
+
+log "play: starting mpv"
+exec mpv --playlist-start=0 --resume-playback=no --playlist="$playlist" "${mpv_args[@]}"

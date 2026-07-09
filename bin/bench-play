@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLAY_BIN="${PLAY_BIN:-$(command -v -play 2>/dev/null || true)}"
+if [[ -z "$PLAY_BIN" ]]; then
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  PLAY_BIN="$here/-play"
+fi
+
+path="${1:-.}"
+echo "bench-play: path=$path" >&2
+echo "bench-play: PLAY_BIN=$PLAY_BIN" >&2
+
+if command -v hyperfine >/dev/null 2>&1; then
+  hyperfine --warmup 1 \
+    "$PLAY_BIN -l '$path' >/dev/null" \
+    "$PLAY_BIN -l -v '$path' >/dev/null" \
+    "$PLAY_BIN -l -i '$path' >/dev/null" \
+    "$PLAY_BIN -l -s +1K '$path' >/dev/null"
+else
+  echo "bench-play: hyperfine not found; using simple time" >&2
+  echo "== fast ==" >&2
+  /usr/bin/time -f '%E real, %M KB maxrss' "$PLAY_BIN" -l "$path" >/dev/null
+  echo "== fast-video ==" >&2
+  /usr/bin/time -f '%E real, %M KB maxrss' "$PLAY_BIN" -l -v "$path" >/dev/null
+  echo "== fast-image ==" >&2
+  /usr/bin/time -f '%E real, %M KB maxrss' "$PLAY_BIN" -l -i "$path" >/dev/null
+  echo "== rich-size ==" >&2
+  /usr/bin/time -f '%E real, %M KB maxrss' "$PLAY_BIN" -l -s +1K "$path" >/dev/null
+fi
